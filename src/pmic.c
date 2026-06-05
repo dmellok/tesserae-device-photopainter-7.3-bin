@@ -6,6 +6,8 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_rom_sys.h"     /* esp_rom_delay_us */
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -59,20 +61,6 @@ static esp_err_t axp_write(uint8_t reg, uint8_t value) {
     return i2c_master_transmit(s_axp2101, buf, sizeof(buf), 50);
 }
 
-/* Read-modify-write a single bit. The XPowersLib helpers do exactly this. */
-static esp_err_t axp_set_bit(uint8_t reg, uint8_t bit, bool set) {
-    uint8_t v = 0;
-    esp_err_t err = axp_read(reg, &v);
-    if (err != ESP_OK) {
-        return err;
-    }
-    uint8_t nv = set ? (v | (1u << bit)) : (v & ~(1u << bit));
-    if (nv == v) {
-        return ESP_OK;
-    }
-    return axp_write(reg, nv);
-}
-
 /* Read-modify-write a 5-bit voltage selector while preserving the top
  * 3 control bits in the same register. */
 static esp_err_t axp_set_voltage_reg(uint8_t reg, uint8_t code) {
@@ -95,9 +83,71 @@ esp_err_t pmic_init(void) {
         return ESP_OK;
     }
 
-    /* I2C0 master bus, 400 kHz, internal pull-ups enabled (the AXP2101
-     * and SHTC3 modules both have on-board pulls but enabling the
-     * internal ones too is harmless and rescues us on hand-wired boards). */
+    /* Wake the AXP2101 by pulsing its IRQ pin (GPIO21) LOW for >16 ms
+     * before touching the bus. After certain PMIC sleep states the
+     * chip powers its I2C interface DOWN; the IRQ pin is the documented
+     * wake source (REG26H[4]). Without this, every transaction below
+     * returns ESP_ERR_INVALID_STATE because the slave never ACKs.
+     * Doing the wake before the bus rescue means the chip is alive by
+     * the time our 9 SCL pulses run, so it sees a normal STOP rather
+     * than a stream of phantom bits during its wake-up window. */
+    {
+        gpio_config_t irq_conf = {
+            .pin_bit_mask = (1ULL << PMIC_PIN_IRQ),
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&irq_conf);
+        gpio_set_level(PMIC_PIN_IRQ, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(PMIC_PIN_IRQ, 1);
+        vTaskDelay(pdMS_TO_TICKS(300));   /* generous post-wake settle */
+        ESP_LOGI(TAG, "AXP2101 IRQ wake pulse done (pre-rescue)");
+    }
+
+    /* Manual I2C bus rescue. If a slave is mid-byte from a previous
+     * power-cycle (SDA held LOW waiting for more SCL pulses), the
+     * master can't initiate a START and every transaction will return
+     * ESP_ERR_INVALID_STATE.
+     *
+     * Standard recovery, ported from aitjcize/esp32-photoframe
+     * (components/board_hal/src/driver_waveshare_photopainter_73.c):
+     *
+     *   1. Configure SCL and SDA as open-drain outputs with pull-ups.
+     *      Open-drain means we force LOW (drive 0) or release HIGH
+     *      (drive 1 = high-Z, pull-up wins). Slaves can only hold SDA;
+     *      we're guaranteed master of SCL.
+     *   2. Toggle SCL 9 times. Each pulse clocks one bit out of the
+     *      stuck slave; after at most 9 clocks it finishes its byte
+     *      and releases SDA.
+     *   3. Issue a STOP condition (SDA low->high while SCL high) so
+     *      the slave returns to idle.
+     *   4. gpio_reset_pin() detaches the pins so the I2C driver can
+     *      re-claim them via IOMUX. */
+    {
+        gpio_set_direction(PMIC_I2C_SCL, GPIO_MODE_OUTPUT_OD);
+        gpio_set_direction(PMIC_I2C_SDA, GPIO_MODE_OUTPUT_OD);
+        gpio_set_pull_mode(PMIC_I2C_SCL, GPIO_PULLUP_ONLY);
+        gpio_set_pull_mode(PMIC_I2C_SDA, GPIO_PULLUP_ONLY);
+        for (int i = 0; i < 9; i++) {
+            gpio_set_level(PMIC_I2C_SCL, 0); esp_rom_delay_us(5);
+            gpio_set_level(PMIC_I2C_SCL, 1); esp_rom_delay_us(5);
+        }
+        /* STOP: SDA low, SCL high, SDA high (LH transition). */
+        gpio_set_level(PMIC_I2C_SDA, 0); esp_rom_delay_us(5);
+        gpio_set_level(PMIC_I2C_SCL, 1); esp_rom_delay_us(5);
+        gpio_set_level(PMIC_I2C_SDA, 1); esp_rom_delay_us(5);
+        gpio_reset_pin(PMIC_I2C_SCL);
+        gpio_reset_pin(PMIC_I2C_SDA);
+        ESP_LOGI(TAG, "I2C bus rescue: 9 SCL pulses + STOP issued");
+    }
+
+
+    /* I2C0 master bus, internal pull-ups enabled (the AXP2101 and SHTC3
+     * modules both have on-board pulls but enabling the internal ones
+     * too is harmless and rescues us on hand-wired boards). */
     if (s_i2c_bus == NULL) {
         i2c_master_bus_config_t bus_cfg = {
             .i2c_port          = PMIC_I2C_PORT,
@@ -183,7 +233,6 @@ esp_err_t pmic_rails_set(bool enabled) {
         /* Panel ICs need a few ms after rail rise before talking SPI. */
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    (void) axp_set_bit;   /* silence the unused-warning; kept for future use */
     return err;
 }
 

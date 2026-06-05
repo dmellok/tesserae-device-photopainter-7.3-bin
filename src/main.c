@@ -9,25 +9,33 @@
  *
  *   boot
  *     -> pmic_init() / wifi_manager_init()
- *     -> BOOT pressed at wake?         yes -> settings server -> reboot
- *     -> double-tap RESET?             yes -> settings server -> reboot
+ *     -> start button-watch task (polls GPIO0 the whole wake)
  *     -> wifi creds in NVS?            no  -> captive portal -> reboot
  *     -> connect STA                   fail-> captive portal -> reboot
+ *     -> BOOT long-press detected?     yes -> settings server -> reboot
  *     -> grab retained MQTT job        miss-> sleep (nothing new to show)
- *     -> url unchanged since last?     yes -> sleep (skip refresh)
+ *     -> url unchanged AND no BOOT tap?yes -> sleep (skip refresh)
  *     -> fetch + decode + paint panel  fail-> sleep (try again next wake)
  *     -> persist new hash              -> deep sleep for sleep_interval_s
+ *
+ * The BOOT button (GPIO0) gives the user two runtime actions:
+ *   tap   -> force a re-paint even if the URL hash matches NVS
+ *   hold  -> open the LAN settings editor instead of the paint cycle
+ * Both are detected concurrently with the wake cycle via a background
+ * task, so a press registered at any point during the few-second wake
+ * takes effect at the next decision point.
  */
 
 #include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
-#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
@@ -44,24 +52,20 @@
 
 static const char *TAG = "main";
 
-/* ---------- settings-mode triggers ---------- */
-/* Two ways to enter settings mode on the PhotoPainter:
- *   1. Hold BOOT (GPIO4) while pressing RESET (PWR/RST). The BOOT pin is
- *      already a strap input, so reading it on early boot is allowed.
- *      This is the primary, intentional path -- no RTC-memory assumption.
- *   2. Double-tap the AXP2101 PWR key within one wake window. Relies on
- *      the AXP2101 not clearing RTC slow-memory on a PEK-triggered reset.
- *      Falls back gracefully to "no-op" if the silicon does clear it.
- */
+/* ---------- BOOT button watcher ---------- */
 
-#define RTC_TAP_MAGIC  0x54455353u   /* 'TESS' */
-RTC_NOINIT_ATTR static uint32_t s_rtc_magic;
-RTC_NOINIT_ATTR static uint32_t s_reset_taps;
+#define BIT_BTN_TAP    BIT0   /* short press completed (released)         */
+#define BIT_BTN_HOLD   BIT1   /* press held past BTN_HOLD_MIN_MS          */
 
-/* Read BOOT at boot. The pin has an external pull-up; pressed = LOW.
- * Configure as plain input -- BOOT is a strap pin so it's already in
- * a sane state at this point. */
-static bool boot_button_held(void) {
+static EventGroupHandle_t s_btn_events;
+
+/* Polls GPIO0 at 50 Hz from a low-priority task started early in
+ * app_main(). Tracks press start time, sets BIT_BTN_HOLD as soon as the
+ * threshold is crossed (one-shot per press) and BIT_BTN_TAP on release
+ * when total press duration was under BTN_TAP_MAX_MS. Runs for the whole
+ * wake -- never exits -- because we deep-sleep before the cycle ends. */
+static void button_watch_task(void *arg) {
+    (void) arg;
     gpio_config_t in = {
         .intr_type    = GPIO_INTR_DISABLE,
         .mode         = GPIO_MODE_INPUT,
@@ -70,37 +74,54 @@ static bool boot_button_held(void) {
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
     };
     gpio_config(&in);
-    /* One spurious low-read can come from line capacitance right after
-     * reset. Sample a few times and majority-vote. */
-    int low_count = 0;
-    for (int i = 0; i < 5; i++) {
-        if (gpio_get_level(BTN_PIN_BOOT) == 0) low_count++;
-        vTaskDelay(pdMS_TO_TICKS(2));
+    /* Give the internal pull-up a moment to overcome line capacitance
+     * before the very first read. */
+    vTaskDelay(pdMS_TO_TICKS(20));
+    /* Log the resting level so we can spot a stuck-low pin (which would
+     * masquerade as a permanent press and lock the device into settings
+     * mode on every boot). Expected: 1 (HIGH, pulled up, not pressed). */
+    ESP_LOGI(TAG, "BOOT (GPIO%d) resting level=%d  (expect 1 = released)",
+             BTN_PIN_BOOT, gpio_get_level(BTN_PIN_BOOT));
+
+    bool pressed = false;
+    bool hold_logged = false;
+    int64_t press_start_us = 0;
+
+    while (1) {
+        bool now = (gpio_get_level(BTN_PIN_BOOT) == 0);
+        int64_t t = esp_timer_get_time();
+
+        if (now && !pressed) {
+            pressed = true;
+            press_start_us = t;
+            hold_logged = false;
+        } else if (now && pressed) {
+            int64_t held_ms = (t - press_start_us) / 1000;
+            if (!hold_logged && held_ms >= BTN_HOLD_MIN_MS) {
+                xEventGroupSetBits(s_btn_events, BIT_BTN_HOLD);
+                ESP_LOGI(TAG, "BOOT long press (%lld ms) -> settings mode",
+                         (long long) held_ms);
+                hold_logged = true;
+            }
+        } else if (!now && pressed) {
+            int64_t held_ms = (t - press_start_us) / 1000;
+            if (!hold_logged && held_ms < BTN_TAP_MAX_MS) {
+                xEventGroupSetBits(s_btn_events, BIT_BTN_TAP);
+                ESP_LOGI(TAG, "BOOT tap (%lld ms) -> force refresh",
+                         (long long) held_ms);
+            }
+            pressed = false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-    return low_count >= 3;
 }
 
-/* Increment on each manual reset; two within one wake window => settings mode.
- * The window is closed by zeroing the counter when we commit to deep sleep
- * so single taps minutes apart don't add up to a false double-tap. */
-static bool double_tap_reset_fired(esp_reset_reason_t reason) {
-    if (s_rtc_magic != RTC_TAP_MAGIC) {   /* power-on / garbage: seed it */
-        s_rtc_magic = RTC_TAP_MAGIC;
-        s_reset_taps = 0;
-    }
-
-    bool manual = (reason == ESP_RST_POWERON || reason == ESP_RST_EXT);
-    if (manual) {
-        s_reset_taps++;
-    } else {
-        s_reset_taps = 0;   /* timer wake / software restart isn't a tap */
-    }
-
-    if (s_reset_taps >= 2) {
-        s_reset_taps = 0;
-        return true;
-    }
-    return false;
+static bool button_tap_seen(void) {
+    return (xEventGroupGetBits(s_btn_events) & BIT_BTN_TAP) != 0;
+}
+static bool button_hold_seen(void) {
+    return (xEventGroupGetBits(s_btn_events) & BIT_BTN_HOLD) != 0;
 }
 
 /* ---------- "should I bother re-rendering?" ---------- */
@@ -160,10 +181,6 @@ static void sleep_forever_or_until_timer(void) {
      *   DEV_FORCE_SLEEP   defined -> always deep-sleep, even on USB host
      *   otherwise -> auto-detect: USB host (laptop / SOF-emitter) loops, a
      *                bare USB charger / power bank does not emit SOFs. */
-    /* Close the double-tap window: once we're committing to sleep/loop, a
-     * later single reset should start counting from zero again. */
-    s_reset_taps = 0;
-
 #if defined(DEV_DISABLE_SLEEP) && defined(DEV_FORCE_SLEEP)
 #  error "DEV_DISABLE_SLEEP and DEV_FORCE_SLEEP are mutually exclusive"
 #endif
@@ -227,24 +244,14 @@ static void maybe_show_splash(esp_reset_reason_t reset_reason) {
         ESP_LOGW(TAG, "panel init failed; skipping splash");
         return;
     }
-    epd_init();
     epd_show_color_bars();
     epd_sleep();
 }
 
 void app_main(void) {
     esp_reset_reason_t reset_reason = esp_reset_reason();
-
-    /* Probe BOOT before anything else so the user's intent is captured
-     * before any subsystem has a chance to drive GPIO4. */
-    bool boot_held = boot_button_held();
-    bool double_tap = double_tap_reset_fired(reset_reason);
-    bool settings_mode = boot_held || double_tap;
-
-    ESP_LOGI(TAG, "boot; reset_reason=%d wakeup_cause=%d boot_held=%d "
-                  "double_tap=%d settings_mode=%d",
-             reset_reason, esp_sleep_get_wakeup_cause(),
-             boot_held, double_tap, settings_mode);
+    ESP_LOGI(TAG, "boot; reset_reason=%d wakeup_cause=%d",
+             reset_reason, esp_sleep_get_wakeup_cause());
 
     /* PMIC first: brings up the panel/SD/codec rails and gives us
      * battery telemetry. If this fails the device is still functional
@@ -253,13 +260,18 @@ void app_main(void) {
         ESP_LOGW(TAG, "PMIC init failed; continuing without battery telemetry");
     }
 
+    /* Start the BOOT-button watcher as early as possible so even a press
+     * during the multi-second WiFi connect is captured. */
+    s_btn_events = xEventGroupCreate();
+    xTaskCreate(button_watch_task, "btn_watch", 3072, NULL,
+                /* priority */ 4, NULL);
+
     ESP_ERROR_CHECK(wifi_manager_init());
 
-    /* Skip the 25 s splash when entering settings mode -- the user is
-     * waiting on the editor, not a panel sanity check. */
-    if (!settings_mode) {
-        maybe_show_splash(reset_reason);
-    }
+    /* Cold-boot splash: a long-press during cold boot still wins later;
+     * a tap before the splash starts is recorded and forces a refresh
+     * after WiFi connects. */
+    maybe_show_splash(reset_reason);
 
     if (!wifi_creds_present()) {
         run_provisioning_then_reboot();
@@ -274,11 +286,11 @@ void app_main(void) {
         return;
     }
 
-    /* Settings mode: serve the always-on settings editor on the LAN
-     * instead of running the paint cycle. Stays up until a save (then
-     * reboot) or the portal timeout (then sleep). */
-    if (settings_mode) {
-        ESP_LOGI(TAG, "settings mode: serving LAN editor + mDNS");
+    /* Long-press detected at any point so far? Switch into the LAN
+     * settings editor instead of the paint cycle. Long-press wins over
+     * any pending tap. */
+    if (button_hold_seen()) {
+        ESP_LOGI(TAG, "settings mode (BOOT long-press): serving LAN editor + mDNS");
         if (settings_server_run_blocking() == ESP_OK) {
             ESP_LOGI(TAG, "settings saved; rebooting to apply");
             esp_restart();
@@ -303,9 +315,24 @@ void app_main(void) {
         return;
     }
 
+    /* A long-press received during the MQTT step still flips us into
+     * settings mode -- the user might press BOOT while the wake is in
+     * flight specifically to grab the device's attention. */
+    if (button_hold_seen()) {
+        ESP_LOGI(TAG, "BOOT long-press during MQTT; switching to settings mode");
+        if (settings_server_run_blocking() == ESP_OK) {
+            esp_restart();
+        }
+        wifi_sta_stop();
+        sleep_forever_or_until_timer();
+        return;
+    }
+
     char hash[65];
     sha256_hex(job.url, hash);
-    if (hash_matches_stored(hash)) {
+    if (button_tap_seen()) {
+        ESP_LOGI(TAG, "BOOT tap detected; forcing refresh (skipping hash check)");
+    } else if (hash_matches_stored(hash)) {
         ESP_LOGI(TAG, "url unchanged since last render; sleeping without refresh");
         wifi_sta_stop();
         sleep_forever_or_until_timer();
@@ -334,7 +361,6 @@ void app_main(void) {
     }
 
     ESP_ERROR_CHECK(epd_port_init());
-    epd_init();
     epd_display(frame);
     epd_sleep();
     free(frame);

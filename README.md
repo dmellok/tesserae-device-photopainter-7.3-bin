@@ -96,9 +96,15 @@ No tests -- smoke-test on real hardware. Recommended validation after any change
 
 ## Credits
 
-Panel driver in [`src/epd_driver.c`](src/epd_driver.c) is a port of Waveshare's reference at [`01_Example/.../components/port_bsp/display_bsp.cpp`](https://github.com/waveshareteam/ESP32-S3-PhotoPainter/blob/main/01_Example/xiaozhi-esp32/components/port_bsp/display_bsp.cpp). The init byte sequence is panel-specific and kept byte-for-byte exact. PMIC register addresses come from Waveshare's bundled XPowersLib component in the same repo.
+The wake state machine, captive-portal provisioning, NVS schema, and MQTT contract are forked verbatim from [`dmellok/tesserae-esp32-bin-client`](https://github.com/dmellok/tesserae-esp32-bin-client) (the 13.3" Spectra E6 sibling).
 
-Wake state machine, captive-portal provisioning, NVS schema, and MQTT contract are forked verbatim from [`dmellok/tesserae-esp32-bin-client`](https://github.com/dmellok/tesserae-esp32-bin-client).
+The PhotoPainter-specific code owes nearly everything that *works* to **[aitjcize/esp32-photoframe](https://github.com/aitjcize/esp32-photoframe)**, whose mature open-source firmware for this exact device was the only reference that actually drove the panel cleanly on our hardware. Three load-bearing pieces are ported from it:
+
+- **AXP2101 wake pulse** in [`src/pmic.c`](src/pmic.c) — pulsing the PMIC's IRQ pin (GPIO21) LOW for >16 ms to wake its I²C interface after a sleep state. Without this, every I²C transaction returns `ESP_ERR_INVALID_STATE` and battery telemetry / rail control are dead. Ported from [`components/pmic_driver_axp2101/src/axp2101.cpp`](https://github.com/aitjcize/esp32-photoframe/blob/main/components/pmic_driver_axp2101/src/axp2101.cpp).
+- **I²C bus rescue** in [`src/pmic.c`](src/pmic.c) — 9 SCL pulses + STOP condition via open-drain GPIO before `i2c_new_master_bus`, in case a slave is mid-byte from a previous power cycle. Ported from [`components/board_hal/src/driver_waveshare_photopainter_73.c`](https://github.com/aitjcize/esp32-photoframe/blob/main/components/board_hal/src/driver_waveshare_photopainter_73.c).
+- **Panel driver protocol** in [`src/epd_driver.c`](src/epd_driver.c) — sending the command byte through the SPI peripheral's command phase (`SPI_TRANS_VARIABLE_CMD`), streaming the frame in 128-byte stack-buffered chunks (PSRAM is unreliable as a direct SPI DMA source on ESP32-S3), and ordering the refresh as `reset → init → DTM → data → PON → DRF → POF → DSLP`. Our first attempt — which followed Waveshare's `xiaozhi-esp32` reference at [`waveshareteam/ESP32-S3-PhotoPainter`](https://github.com/waveshareteam/ESP32-S3-PhotoPainter) — issued PON during init and DMA'd directly from PSRAM, and the panel hung at every refresh. Aitjcize's pattern recovers reliably. Ported from [`components/epaper_driver_ed2208_gca/src/driver_ed2208_gca.c`](https://github.com/aitjcize/esp32-photoframe/blob/main/components/epaper_driver_ed2208_gca/src/driver_ed2208_gca.c).
+
+The panel command-byte values themselves still come from Waveshare's [`waveshareteam/ESP32-S3-PhotoPainter`](https://github.com/waveshareteam/ESP32-S3-PhotoPainter) reference.
 
 ## License
 

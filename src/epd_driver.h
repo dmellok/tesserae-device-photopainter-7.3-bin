@@ -22,13 +22,6 @@
 /* One-time SPI bus + GPIO setup. Safe to call multiple times. */
 esp_err_t epd_port_init(void);
 
-/* Full panel power-up + reset + init sequence. Call after epd_port_init()
- * and before epd_clear() / epd_display().
- *
- * NOTE: pmic_init() must have run first -- this function calls into
- * pmic_rails_set(true) to bring the panel rail up. */
-void epd_init(void);
-
 /* Fill the entire panel with a single palette color and refresh. */
 void epd_clear(uint8_t color);
 

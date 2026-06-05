@@ -60,22 +60,38 @@
 #define PMIC_I2C_PORT       0
 #define PMIC_I2C_SCL        48
 #define PMIC_I2C_SDA        47
-#define PMIC_I2C_HZ         400000
+/* Waveshare's reference talks to the AXP2101 at 100 kHz; bumping to
+ * 400 kHz returns ESP_ERR_INVALID_STATE on every transaction on this
+ * board (probably weak pull-ups on the long PMIC trace). */
+#define PMIC_I2C_HZ         100000
 #define PMIC_AXP2101_ADDR   0x34
 #define PMIC_PIN_IRQ        21
-#define PMIC_PIN_CHGLED     3
 
 /* ------------------------------------------------------------------ */
 /* Buttons & LEDs                                                     */
 /* ------------------------------------------------------------------ */
-/* PWR key is the AXP2101 PEK -- short-press wake / long-press off    */
-/* is handled by the PMIC itself. Wired to GPIO5 so firmware can read */
-/* state if it wants to, but we don't depend on it. BOOT (GPIO4) is   */
-/* the user-button; double-tap-on-wake triggers the settings editor   */
-/* (analogous to "double-tap RESET" on the 13.3" board, which lacks   */
-/* a user button).                                                    */
-#define BTN_PIN_PWR    5     /* AXP2101 PEK, active low */
-#define BTN_PIN_BOOT   4     /* user button, active low, also strap pin */
+/* The PhotoPainter exposes two user-facing buttons:
+ *   BOOT (GPIO0)  -- ESP32-S3 boot-strap pin; ACTIVE LOW
+ *   PWR  (GPIO5)  -- AXP2101 PEK output; ACTIVE HIGH (inverted via PMIC)
+ *
+ * BOOT is the boot-strap pin, so holding it LOW at reset puts the chip
+ * into ROM serial-download mode and our firmware never runs. We can
+ * only sample it *after* boot completes -- never at reset. PWR is owned
+ * by the AXP2101: short-press wakes the SoC, long-press kills it, all
+ * in hardware. The firmware reads BOOT during the wake window for two
+ * user actions:
+ *
+ *   tap   (<BTN_TAP_MAX_MS)   -> force refresh (clear the URL hash)
+ *   hold  (>=BTN_HOLD_MIN_MS) -> enter the LAN settings editor
+ *
+ * GPIO4 is a third button ("GP4") in Waveshare's reference, but its
+ * presence on the production PhotoPainter casing isn't documented, so
+ * we don't map it. */
+#define BTN_PIN_PWR    5     /* AXP2101 PEK, active high */
+#define BTN_PIN_BOOT   0     /* "BOOT" labeled button, active low */
+
+#define BTN_TAP_MAX_MS    500    /* press shorter than this -> tap   */
+#define BTN_HOLD_MIN_MS   2000   /* press at or beyond this -> hold  */
 
 /* Status LEDs. Both active-LOW (LED_ON == 0). */
 #define LED_PIN_RED    45
@@ -95,9 +111,10 @@
 #define FW_VERSION         "0.0.0-dev"
 #endif
 
-/* How long to deep-sleep between MQTT checks. 15 minutes is a good
- * trade for a 6-color panel that itself takes ~25 s to refresh. */
-#define SLEEP_INTERVAL_S   (15 * 60)
+/* How long to deep-sleep between MQTT checks. 5 minutes is short
+ * enough to feel responsive while still keeping the wake-cycle cost
+ * well under the panel-refresh cost on a multi-color update. */
+#define SLEEP_INTERVAL_S   (5 * 60)
 
 /* Cap on how long we'll wait for a retained MQTT message after
  * subscribing, before giving up and going back to sleep. */

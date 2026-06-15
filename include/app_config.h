@@ -19,21 +19,18 @@
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Panel: Waveshare ESP32-S3 PhotoPainter (7.3" Spectra E6, 800x480)  */
-/* Pinout taken from Waveshare's reference code:                      */
-/*   waveshareteam/ESP32-S3-PhotoPainter                              */
-/*     04_PowerConsumptionTest/.../bsp_config.h     (EPD/SDMMC/LED)   */
-/*     05_ArduinoExample/01_Audio_Test.ino           (I2C)            */
-/*     01_Example/.../components/port_bsp/button_bsp.c (PWR_KEY)      */
+/* Panel: Seeed Studio reTerminal E1002 (7.3" Spectra E6, 800x480)   */
+/* Pinout for Seeed Studio reTerminal E1002                          */
+/* Based on: https://wiki.seeedstudio.com/reTerminal_E1002/          */
 /* ------------------------------------------------------------------ */
 
-/* E-paper panel SPI: single chip-select (unlike the 13.3" dual-CS panel) */
-#define EPD_PIN_SCLK   10
-#define EPD_PIN_MOSI   11
-#define EPD_PIN_CS     9
-#define EPD_PIN_DC     8
-#define EPD_PIN_RST    12
-#define EPD_PIN_BUSY   13
+/* E-paper panel SPI: single chip-select (как и у Waveshare 7.3") */
+#define EPD_PIN_SCLK   7     /* GPIO7  - SPI Clock */
+#define EPD_PIN_MOSI   9     /* GPIO9  - SPI Data (MOSI) */
+#define EPD_PIN_CS     10    /* GPIO10 - Chip Select */
+#define EPD_PIN_DC     11    /* GPIO11 - Data/Command */
+#define EPD_PIN_RST    12    /* GPIO12 - Reset */
+#define EPD_PIN_BUSY   13    /* GPIO13 - Busy pin */
 
 #define EPD_SPI_HOST   SPI3_HOST
 #define EPD_SPI_HZ     (10 * 1000 * 1000)
@@ -53,51 +50,36 @@
 
 /* ------------------------------------------------------------------ */
 /* Power management: AXP2101 PMIC over I2C                            */
-/* The PhotoPainter has no GPIO panel-power gate and no ADC battery   */
-/* divider; the AXP2101 handles both. Battery mV/% come from the      */
-/* on-chip fuel gauge; panel rail is an AXP2101 LDO output.           */
+/* reTerminal E1002 использует AXP2101 для управления питанием       */
+/* I2C пины: SCL=GPIO20, SDA=GPIO19 (из документации Seeed)          */
 /* ------------------------------------------------------------------ */
 #define PMIC_I2C_PORT       0
-#define PMIC_I2C_SCL        48
-#define PMIC_I2C_SDA        47
-/* Waveshare's reference talks to the AXP2101 at 100 kHz; bumping to
- * 400 kHz returns ESP_ERR_INVALID_STATE on every transaction on this
- * board (probably weak pull-ups on the long PMIC trace). */
+#define PMIC_I2C_SCL        20    /* GPIO20 - I2C Clock */
+#define PMIC_I2C_SDA        19    /* GPIO19 - I2C Data */
 #define PMIC_I2C_HZ         100000
 #define PMIC_AXP2101_ADDR   0x34
-#define PMIC_PIN_IRQ        21
+#define PMIC_PIN_IRQ        21    /* GPIO21 - PMIC IRQ */
 
 /* ------------------------------------------------------------------ */
-/* Buttons & LEDs                                                     */
+/* Buttons & LEDs (reTerminal E1002 специфичные пины)                 */
 /* ------------------------------------------------------------------ */
-/* The PhotoPainter exposes two user-facing buttons:
- *   BOOT (GPIO0)  -- ESP32-S3 boot-strap pin; ACTIVE LOW
- *   PWR  (GPIO5)  -- AXP2101 PEK output; ACTIVE HIGH (inverted via PMIC)
- *
- * BOOT is the boot-strap pin, so holding it LOW at reset puts the chip
- * into ROM serial-download mode and our firmware never runs. We can
- * only sample it *after* boot completes -- never at reset. PWR is owned
- * by the AXP2101: short-press wakes the SoC, long-press kills it, all
- * in hardware. The firmware reads BOOT during the wake window for two
- * user actions:
- *
- *   tap   (<BTN_TAP_MAX_MS)   -> force refresh (clear the URL hash)
- *   hold  (>=BTN_HOLD_MIN_MS) -> enter the LAN settings editor
- *
- * GPIO4 is a third button ("GP4") in Waveshare's reference, but its
- * presence on the production PhotoPainter casing isn't documented, so
- * we don't map it. */
-#define BTN_PIN_PWR    5     /* AXP2101 PEK, active high */
-#define BTN_PIN_BOOT   0     /* "BOOT" labeled button, active low */
+/* reTerminal E1002 имеет несколько кнопок:
+ *   POWER   - питание (отдельная схема)
+ *   GREEN   - зеленая кнопка (GPIO3) - активный LOW
+ *   RIGHT   - правая кнопка (GPIO4)  - активный LOW
+ *   LEFT    - левая кнопка  (GPIO5)  - активный LOW
+ */
+#define BTN_PIN_GREEN   3     /* Зеленая кнопка, active low */
+#define BTN_PIN_RIGHT   4     /* Правая кнопка, active low */
+#define BTN_PIN_LEFT    5     /* Левая кнопка, active low */
 
 #define BTN_TAP_MAX_MS    500    /* press shorter than this -> tap   */
 #define BTN_HOLD_MIN_MS   2000   /* press at or beyond this -> hold  */
 
-/* Status LEDs. Both active-LOW (LED_ON == 0). */
-#define LED_PIN_RED    45
-#define LED_PIN_GREEN  42
-#define LED_ON_LEVEL   0
-#define LED_OFF_LEVEL  1
+/* Status LED (на reTerminal E1002 есть встроенный светодиод) */
+#define LED_PIN_STATUS   1     /* GPIO1 - встроенный светодиод */
+#define LED_ON_LEVEL     1     /* Активный HIGH */
+#define LED_OFF_LEVEL    0
 
 /* ------------------------------------------------------------------ */
 /* Application behavior                                               */
@@ -152,11 +134,10 @@
 #ifndef MQTT_DEFAULT_URI
 #define MQTT_DEFAULT_URI    "mqtt://homeassistant.local:1883"
 #endif
-/* Per-device topic namespace is tesserae/<device_id>/{frame/bin,config,status}.
- * Default differs from the 13.3" client ("esp32") so the two panels can
- * share one broker without colliding. */
+
+/* Per-device topic namespace is tesserae/<device_id>/{frame/bin,config,status}. */
 #ifndef MQTT_DEFAULT_DEVICE_ID
-#define MQTT_DEFAULT_DEVICE_ID  "photopainter-73"
+#define MQTT_DEFAULT_DEVICE_ID  "reterminal-e1002"
 #endif
 #ifndef MQTT_DEFAULT_USER
 #define MQTT_DEFAULT_USER   ""
@@ -165,13 +146,12 @@
 #define MQTT_DEFAULT_PASS   ""
 #endif
 #ifndef MQTT_CLIENT_ID
-#define MQTT_CLIENT_ID      "tesserae-photopainter-73-1"
+#define MQTT_CLIENT_ID      "tesserae-reterminal-e1002-1"
 #endif
 
 /* The `kind` field in the heartbeat is just a UI hint for Tesserae's
  * Register form -- the renderer dispatches on panel_w/panel_h, both of
- * which we already publish below. Reusing the 13.3" client's value
- * means the server needs no new renderer for the 7.3" panel. */
+ * which we already publish below. */
 #ifndef DEVICE_KIND
 #define DEVICE_KIND         "esp32_client"
 #endif

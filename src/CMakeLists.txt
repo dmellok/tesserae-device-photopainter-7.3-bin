@@ -19,8 +19,8 @@ idf_component_register(
         "../assets/splash_portal.bin"
     REQUIRES
         driver
-        esp_driver_i2c
-        esp_driver_usb_serial_jtag
+        i2c
+        usb
         esp_event
         esp_http_client
         esp_http_server

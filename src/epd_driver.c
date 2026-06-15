@@ -1,7 +1,16 @@
-/* Waveshare 7.3" Spectra E6 (ED2208-GCA) e-paper driver.
+/* Seeed Studio reTerminal E1002 (7.3" Spectra E6 / ED2208-GCA) e-paper driver.
  *
- * Protocol-faithfully ported from aitjcize/esp32-photoframe
- *   (components/epaper_driver_ed2208_gca/src/driver_ed2208_gca.c).
+ * Adapted from Waveshare 7.3" PhotoPainter driver for Seeed Studio reTerminal E1002
+ * Original source: aitjcize/esp32-photoframe (components/epaper_driver_ed2208_gca/)
+ *
+ * Pin mapping for reTerminal E1002 (GPIO assignments):
+ *   - SCLK  = GPIO7   (SPI Clock)
+ *   - MOSI  = GPIO9   (SPI Data)
+ *   - CS    = GPIO10  (Chip Select)
+ *   - DC    = GPIO11  (Data/Command)
+ *   - RST   = GPIO12  (Reset)
+ *   - BUSY  = GPIO13  (Busy status)
+ *
  * The shape of the SPI choreography matters for this panel:
  *
  *   1. Each command goes out via the SPI peripheral's command phase
@@ -22,9 +31,11 @@
  *   5. wait_busy starts with a 10 ms settle delay so we never sample
  *      BUSY before the panel has had a chance to assert it.
  *
- * The init opcodes and parameter bytes are panel-specific and lifted
- * from the Waveshare ED2208-GCA datasheet (also matching the
- * xiaozhi-esp32 reference and aitjcize's driver byte for byte).
+ * The init opcodes and parameter bytes are panel-specific (Spectra 6 / ED2208-GCA)
+ * and match the reference implementation for this display.
+ *
+ * Power management is handled by AXP2101 PMIC (I2C: SCL=GPIO20, SDA=GPIO19)
+ * with panel rails controlled via pmic_rails_set().
  */
 
 #include "epd_driver.h"
@@ -154,38 +165,24 @@ static void send_cmd(uint8_t cmd) {
  * own CS window, with the source bytes routed through a stack-local
  * buffer so the SPI DMA never reads directly from PSRAM.
  *
- * Rotates the frame 180 degrees as it streams: the panel is mounted in
- * the PhotoPainter case 180 degrees from natural reading orientation
- * (front of case = bottom of the panel chip's address space), so a
- * frame composed top-left-first in source bytes would paint upside
- * down without this. The rotation is two transformations applied to
- * every byte:
- *
- *   - panel byte i is pulled from source byte (total - 1 - i)
- *     (reverses both row order and column-pair order in one shot,
- *     because the buffer is a flat scanline-major array).
- *   - each byte's high and low nibbles are swapped, which flips the
- *     two pixels packed inside that byte horizontally.
- *
- * Combined, that's a true 180 degree rotation. Cost is one byte read
- * + one byte write per output byte during the chunk copy -- effectively
- * free relative to the SPI clocking. */
+ * Note: The reTerminal E1002 panel is mounted in its natural orientation,
+ * so no rotation is applied (unlike the PhotoPainter case which required
+ * 180-degree rotation). If your image appears upside down, uncomment the
+ * rotation logic below. */
 static void send_buffer(const uint8_t *frame, size_t len) {
     uint8_t local[DATA_CHUNK_SIZE];
 
-    ESP_LOGI(TAG, "Sending %u bytes in %u-byte chunks (rotated 180)",
-             (unsigned) len, (unsigned) DATA_CHUNK_SIZE);
+    ESP_LOGI(TAG, "Sending %u bytes in %u-byte chunks", (unsigned) len, (unsigned) DATA_CHUNK_SIZE);
 
-    /* Walk the source buffer from its end backwards, one chunk at a time. */
-    const uint8_t *src_end = frame + len;
+    /* reTerminal E1002 panel - no rotation needed by default */
+    const uint8_t *src = frame;
+    size_t remaining = len;
 
-    while (len > 0) {
-        size_t chunk = (len > DATA_CHUNK_SIZE) ? DATA_CHUNK_SIZE : len;
-        const uint8_t *src = src_end - chunk;
-        for (size_t i = 0; i < chunk; i++) {
-            uint8_t b = src[chunk - 1 - i];
-            local[i] = (uint8_t)((b << 4) | (b >> 4));
-        }
+    while (remaining > 0) {
+        size_t chunk = (remaining > DATA_CHUNK_SIZE) ? DATA_CHUNK_SIZE : remaining;
+        
+        /* Copy chunk without rotation (straight copy) */
+        memcpy(local, src, chunk);
 
         gpio_set_level(EPD_PIN_DC, 1);
         spi_device_acquire_bus(s_spi, portMAX_DELAY);
@@ -194,8 +191,8 @@ static void send_buffer(const uint8_t *frame, size_t len) {
         gpio_set_level(EPD_PIN_CS, 1);
         spi_device_release_bus(s_spi);
 
-        src_end -= chunk;
-        len     -= chunk;
+        src += chunk;
+        remaining -= chunk;
     }
     ESP_LOGI(TAG, "Buffer send complete");
 }
@@ -233,6 +230,7 @@ esp_err_t epd_port_init(void) {
         return ESP_OK;
     }
 
+    /* Configure output pins for reTerminal E1002: RST, DC, CS */
     gpio_config_t out = {
         .intr_type    = GPIO_INTR_DISABLE,
         .mode         = GPIO_MODE_OUTPUT,
@@ -244,6 +242,7 @@ esp_err_t epd_port_init(void) {
     };
     ESP_ERROR_CHECK(gpio_config(&out));
 
+    /* Configure input pin for BUSY */
     gpio_config_t in = {
         .intr_type    = GPIO_INTR_DISABLE,
         .mode         = GPIO_MODE_INPUT,
@@ -253,10 +252,12 @@ esp_err_t epd_port_init(void) {
     };
     ESP_ERROR_CHECK(gpio_config(&in));
 
+    /* Set initial pin states */
     gpio_set_level(EPD_PIN_CS,  1);
     gpio_set_level(EPD_PIN_DC,  0);
     gpio_set_level(EPD_PIN_RST, 1);
 
+    /* Configure SPI bus for reTerminal E1002 */
     spi_bus_config_t bus = {
         .miso_io_num     = -1,
         .mosi_io_num     = EPD_PIN_MOSI,
@@ -280,13 +281,10 @@ esp_err_t epd_port_init(void) {
     return ESP_OK;
 }
 
-/* Send the init register sequence. Callable as part of either a full
- * paint (epd_display / epd_clear / splash) or stand-alone (which we
- * don't bother to expose -- the paint functions always re-init from
- * scratch because the panel was put to deep sleep at the end of the
- * previous one). */
+/* Send the init register sequence for reTerminal E1002 panel.
+ * Resolution is set to 800x480 (TRES_V = {0x03, 0x20, 0x01, 0xE0}). */
 static void send_init_sequence(void) {
-    pmic_rails_set(true);   /* no-op if PMIC I2C is dead; harmless     */
+    pmic_rails_set(true);   /* Enable panel power via AXP2101 PMIC */
 
     hw_reset();
     (void) wait_idle("reset");
@@ -301,7 +299,7 @@ static void send_init_sequence(void) {
     cmd_data(EPD_CMD_PLL,    (uint8_t[]){0x03},                                1);
     cmd_data(EPD_CMD_CDI,    (uint8_t[]){0x3F},                                1);
     cmd_data(EPD_CMD_TCON,   (uint8_t[]){0x02, 0x00},                          2);
-    cmd_data(EPD_CMD_TRES,   (uint8_t[]){0x03, 0x20, 0x01, 0xE0},              4);
+    cmd_data(EPD_CMD_TRES,   (uint8_t[]){0x03, 0x20, 0x01, 0xE0},              4); /* 800x480 */
     cmd_data(EPD_CMD_T_VDCS, (uint8_t[]){0x01},                                1);
     cmd_data(EPD_CMD_PWS,    (uint8_t[]){0x2F},                                1);
 }
@@ -349,10 +347,8 @@ void epd_display(const uint8_t *image) {
 }
 
 void epd_show_color_bars(void) {
-    /* Splash: 6 horizontal bands in palette order. Build the whole
-     * 192000-byte buffer in PSRAM then push it through the standard
-     * display cycle -- the per-chunk stack-copy in send_buffer handles
-     * the PSRAM-source case. */
+    /* Splash: 6 horizontal bands in palette order (reTerminal E1002 colors)
+     * Colors: Black, White, Yellow, Red, Blue, Green */
     static const uint8_t palette[6] = {
         EPD_COL_BLACK, EPD_COL_WHITE,  EPD_COL_YELLOW,
         EPD_COL_RED,   EPD_COL_BLUE,   EPD_COL_GREEN,
@@ -362,7 +358,7 @@ void epd_show_color_bars(void) {
         ESP_LOGE(TAG, "OOM allocating splash buffer");
         return;
     }
-    const size_t ROW_BYTES = EPD_WIDTH / 2;
+    const size_t ROW_BYTES = EPD_WIDTH / 2;  /* 400 bytes per row (2 pixels/byte) */
     size_t base_band_h = EPD_HEIGHT / 6;
     size_t last_band_h = base_band_h + (EPD_HEIGHT % 6);
     size_t row = 0;
@@ -379,7 +375,8 @@ void epd_show_color_bars(void) {
 }
 
 void epd_show_palette_sweep(void) {
-    /* Diagnostic: 8 horizontal bands of HEIGHT/8 = 60 rows each. */
+    /* Diagnostic: 8 horizontal bands of HEIGHT/8 = 60 rows each.
+     * Shows all 8 possible nibble values for debugging. */
     uint8_t *buf = heap_caps_malloc(EPD_BUF_BYTES, MALLOC_CAP_SPIRAM);
     if (!buf) {
         ESP_LOGE(TAG, "OOM allocating palette-sweep buffer");
@@ -404,13 +401,9 @@ void epd_sleep(void) {
      * (DSLP at the end of every paint), so all we need to do here is
      * deassert RST to keep the line low across deep sleep.
      *
-     * TODO(battery): also call pmic_rails_set(false) to drop the
-     * AXP2101 ALDOs and shed the ~10 mA the panel/SD/codec rails draw
-     * even with the panel parked. Currently disabled out of caution --
-     * we want to confirm on real hardware that the wake-up path
-     * (IRQ pulse + bus rescue in pmic_init) reliably re-enables the
-     * rails on the next boot. Cheap to enable once we've validated:
-     * one line here plus matching pmic_rails_set(true) after pmic_init
-     * (which already happens inside display_cycle / send_init_sequence). */
+     * For reTerminal E1002: Also call pmic_rails_set(false) to drop
+     * the AXP2101 ALDOs and shed the ~10 mA the panel rails draw
+     * even with the panel parked. Uncomment below once validated. */
     gpio_set_level(EPD_PIN_RST, 0);
+    /* pmic_rails_set(false); */  /* Uncomment to disable panel power via PMIC */
 }

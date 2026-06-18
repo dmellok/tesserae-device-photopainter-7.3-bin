@@ -181,4 +181,4 @@ The panel command-byte values themselves still come from Waveshare's [`waveshare
 
 ## License
 
-MIT.
+AGPL-3.0-or-later. See [LICENSE](LICENSE).

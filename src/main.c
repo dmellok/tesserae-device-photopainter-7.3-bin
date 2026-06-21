@@ -60,6 +60,7 @@
 #include "mqtt_handler.h"
 #include "pmic.h"
 #include "provisioning.h"
+#include "rest_handler.h"
 #include "splash.h"
 #include "wifi_manager.h"
 
@@ -168,6 +169,35 @@ static void store_hash(const char *hash) {
     nvs_close(h);
 }
 
+/* Returns TRANSPORT_MODE_MQTT (legacy) or TRANSPORT_MODE_REST.
+ *
+ * Precedence:
+ *   1. NVS key (captive portal / settings page wrote it)  -- always wins
+ *   2. secrets.h REST_DEFAULT_SERVER_URL set non-empty     -- defaults to REST
+ *   3. TRANSPORT_DEFAULT_MODE (= MQTT)                     -- legacy upgrade path
+ *
+ * The secrets.h shortcut lets developers flash a clean board straight
+ * into REST mode without the portal step -- mirrors the MQTT_DEFAULT_*
+ * shortcut already in use. */
+static transport_mode_t load_transport_mode(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_REST, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t nvs_v = 0xFF;
+        esp_err_t err = nvs_get_u8(h, NVS_KEY_TRANSPORT_MODE, &nvs_v);
+        nvs_close(h);
+        if (err == ESP_OK) {
+            return (nvs_v == TRANSPORT_MODE_REST) ? TRANSPORT_MODE_REST
+                                                  : TRANSPORT_MODE_MQTT;
+        }
+    }
+    /* No NVS override -- fall back to compile-time defaults. */
+    if (REST_DEFAULT_SERVER_URL[0] != '\0') {
+        return TRANSPORT_MODE_REST;
+    }
+    return (TRANSPORT_DEFAULT_MODE == TRANSPORT_MODE_REST)
+               ? TRANSPORT_MODE_REST : TRANSPORT_MODE_MQTT;
+}
+
 /* Read the MQTT-configured sleep interval from NVS, falling back to the
  * compile-time SLEEP_INTERVAL_S default. Clamped defensively in case
  * something wrote a bad value before the bounds check existed. */
@@ -188,7 +218,16 @@ static int load_sleep_interval_s(void) {
 
 /* ---------- deep sleep ---------- */
 
+/* Override version: caller knows the wake interval (e.g. REST's
+ * /status response said next_poll_s=N). 0 = "use NVS / compile
+ * default" (legacy MQTT behaviour). */
+static void sleep_forever_or_until_timer_with(int override_s);
+
 static void sleep_forever_or_until_timer(void) {
+    sleep_forever_or_until_timer_with(0);
+}
+
+static void sleep_forever_or_until_timer_with(int override_s) {
     /* Decide between deep sleep (battery) and short-delay restart loop (dev):
      *   DEV_DISABLE_SLEEP defined -> always loop (dev override)
      *   DEV_FORCE_SLEEP   defined -> always deep-sleep, even on USB host
@@ -214,12 +253,29 @@ static void sleep_forever_or_until_timer(void) {
 #endif
 
     if (loop) {
-        ESP_LOGI(TAG, "%s: software restart in %d s", reason, DEV_LOOP_INTERVAL_S);
-        vTaskDelay(pdMS_TO_TICKS(DEV_LOOP_INTERVAL_S * 1000));
+        /* Dev-loop cadence: prefer the REST-server-supplied next_poll_s
+         * so USB and battery behave identically -- otherwise testing
+         * server-driven sleep contracts is impossible on a plugged-in
+         * board. Clamp to a sane min so a misbehaving server can't pin
+         * the loop at zero. Falls back to DEV_LOOP_INTERVAL_S only on
+         * the legacy MQTT path that has no per-cycle override. */
+        int loop_s = (override_s > 0) ? override_s : DEV_LOOP_INTERVAL_S;
+        if (loop_s < SLEEP_INTERVAL_MIN_S) loop_s = SLEEP_INTERVAL_MIN_S;
+        ESP_LOGI(TAG, "%s: software restart in %d s%s",
+                 reason, loop_s,
+                 (override_s > 0) ? " (from REST next_poll_s)" : "");
+        vTaskDelay(pdMS_TO_TICKS(loop_s * 1000));
         esp_restart();
     }
 
-    int interval = load_sleep_interval_s();
+    int interval;
+    if (override_s > 0) {
+        if (override_s < SLEEP_INTERVAL_MIN_S) override_s = SLEEP_INTERVAL_MIN_S;
+        if (override_s > SLEEP_INTERVAL_MAX_S) override_s = SLEEP_INTERVAL_MAX_S;
+        interval = override_s;
+    } else {
+        interval = load_sleep_interval_s();
+    }
     ESP_LOGI(TAG, "on battery; deep sleep for %d s%s",
              interval,
              (interval == SLEEP_INTERVAL_S) ? " (default)" : " (set via mqtt)");
@@ -429,6 +485,44 @@ void app_main(void) {
         sleep_forever_or_until_timer();
         return;
     }
+
+    /* ---- post-pairing splash ----
+     * If the captive portal set the "paired pending" flag on its way
+     * out, repaint the panel from the QR-portal splash to "Connected
+     * -- waiting for first frame" so the visible state matches reality.
+     * One-shot: paint then clear the flag. Costs ~25 s of panel refresh
+     * on exactly one wake. */
+    {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NS_STATE, NVS_READWRITE, &h) == ESP_OK) {
+            uint8_t pending = 0;
+            if (nvs_get_u8(h, NVS_KEY_PAIRED_PEND, &pending) == ESP_OK && pending) {
+                ESP_LOGI(TAG, "post-pairing splash: painting Connected/Waiting");
+                splash_show_paired();
+                nvs_erase_key(h, NVS_KEY_PAIRED_PEND);
+                nvs_commit(h);
+            }
+            nvs_close(h);
+        }
+    }
+
+    /* ---- transport dispatch ----
+     * REST mode runs its own wake loop (discover/register, frame GET
+     * with If-None-Match, paint, status POST) and returns the
+     * server-suggested next_poll_s for this cycle. MQTT mode falls
+     * through to the existing retained-subscribe path below. */
+    transport_mode_t transport = load_transport_mode();
+    if (transport == TRANSPORT_MODE_REST) {
+        ESP_LOGI(TAG, "transport=rest");
+        bool cold_boot = (reset_reason == ESP_RST_POWERON ||
+                          reset_reason == ESP_RST_EXT);
+        ensure_time_synced(5000, cold_boot);
+        int next_poll_s = rest_run_loop(reset_reason);
+        wifi_sta_stop();
+        sleep_forever_or_until_timer_with(next_poll_s);
+        return;
+    }
+    ESP_LOGI(TAG, "transport=mqtt");
 
     int sleep_s = load_sleep_interval_s();
 

@@ -23,3 +23,11 @@ esp_err_t splash_show_logo(void);
  * change in app_config.h, rerun tools/gen_splash.py to regenerate the
  * blob. */
 esp_err_t splash_show_portal(void);
+
+/* Logo centered with "Connected to Tesserae" / "Waiting for first frame"
+ * labels. Painted exactly ONCE, on the first boot after the user submits
+ * the captive portal -- replaces the portal-splash QR on the panel so
+ * the visible state matches "we're past pairing and waiting on the
+ * server." Triggered by an NVS flag set in provisioning.c's h_save and
+ * cleared in main.c after the splash paints. */
+esp_err_t splash_show_paired(void);

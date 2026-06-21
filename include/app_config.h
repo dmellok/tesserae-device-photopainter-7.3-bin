@@ -203,11 +203,74 @@
 #define DEVICE_ID_MAX_LEN   32
 
 #define NVS_NS_STATE       "state"
-#define NVS_KEY_LAST_HASH  "last_hash"   /* sha256 of last rendered URL */
+#define NVS_KEY_LAST_HASH  "last_hash"   /* sha256 of last rendered URL (mqtt mode) */
 #define NVS_KEY_SLEEP_S    "sleep_s"     /* user-configured deep-sleep duration */
+#define NVS_KEY_PAIRED_PEND "paired_pen" /* u8: 1 == captive portal saved creds, paint
+                                          *      "Connected/Waiting for first frame"
+                                          *      splash on next boot once WiFi is up */
 
 /* Sanity bounds on sleep interval. The lower bound stops a publisher
  * accidentally turning the device into a 1-Hz spinner; the upper bound
  * is just "this is probably a bug". */
 #define SLEEP_INTERVAL_MIN_S  30
 #define SLEEP_INTERVAL_MAX_S  (7 * 24 * 60 * 60)
+
+/* ------------------------------------------------------------------ */
+/* Transport mode + REST-API configuration                            */
+/* ------------------------------------------------------------------ */
+/* The firmware can talk to Tesserae two ways:
+ *   0 = mqtt  : retained-topic subscribe + publish (the original)
+ *   1 = rest  : HTTP polling against /api/v1/device/<id>/{frame,status}
+ *               (no broker required; default for new installs)
+ * Existing installs upgrading from <0.3.0 see transport_mode absent in
+ * NVS and default to MQTT for backward compatibility. New first-boots
+ * pick from the captive portal radio. */
+typedef enum {
+    TRANSPORT_MODE_MQTT = 0,
+    TRANSPORT_MODE_REST = 1,
+} transport_mode_t;
+
+#define NVS_NS_REST            "rest"
+#define NVS_KEY_TRANSPORT_MODE "transport"     /* u8: transport_mode_t */
+#define NVS_KEY_SERVER_URL     "server_url"    /* e.g. http://tesserae.local:8765 */
+#define NVS_KEY_DEVICE_TOKEN   "device_token"  /* bearer; set after register/discover */
+#define NVS_KEY_PAIRING_CODE   "pair_code"     /* 6-char; cleared after register */
+#define NVS_KEY_FRAME_ETAG     "frame_etag"    /* for If-None-Match -> 304 path */
+
+/* Discover-retry default when the server says "registered: false" with
+ * no retry_after_s hint. The admin clicks Register on the Tesserae UI;
+ * the next discover after this window claims the token. 30 s gives the
+ * admin time without blowing the battery on a constant retry storm. */
+#define REST_DISCOVER_RETRY_DEFAULT_S   30
+
+/* Fallback when /status response omits next_poll_s. Same value as the
+ * MQTT path's SLEEP_INTERVAL_S keeps the failure mode predictable. */
+#define REST_NEXT_POLL_FALLBACK_S       SLEEP_INTERVAL_S
+
+/* HTTP client tuning (esp_http_client). Buffer at 1024 because the
+ * /frame response headers (ETag + standard set) overflow the 512-byte
+ * default. 15 s for JSON endpoints; the .bin fetch path uses its own
+ * longer timeout via image_fetcher. */
+#define REST_HTTP_BUFFER_SIZE     1024
+#define REST_HTTP_TIMEOUT_MS      15000
+
+/* Compile-time REST defaults. Optional -- secrets.h may override either
+ * to skip captive-portal entry on a freshly flashed dev board. */
+#ifndef REST_DEFAULT_SERVER_URL
+#define REST_DEFAULT_SERVER_URL   ""
+#endif
+#ifndef REST_DEFAULT_PAIRING_CODE
+#define REST_DEFAULT_PAIRING_CODE ""
+#endif
+#ifndef REST_DEFAULT_DEVICE_TOKEN
+#define REST_DEFAULT_DEVICE_TOKEN ""
+#endif
+
+/* Default transport when NVS has no transport_mode key set. Existing
+ * MQTT installs upgrading from <0.3.0 land here -- explicit
+ * backward-compat. A secrets.h with REST_DEFAULT_SERVER_URL filled in
+ * overrides this at runtime in load_transport_mode() (see main.c) so
+ * developers can flash a clean board straight into REST mode. */
+#ifndef TRANSPORT_DEFAULT_MODE
+#define TRANSPORT_DEFAULT_MODE    TRANSPORT_MODE_MQTT
+#endif

@@ -12,6 +12,8 @@ extern const uint8_t splash_logo_bin_start[]   asm("_binary_splash_logo_bin_star
 extern const uint8_t splash_logo_bin_end[]     asm("_binary_splash_logo_bin_end");
 extern const uint8_t splash_portal_bin_start[] asm("_binary_splash_portal_bin_start");
 extern const uint8_t splash_portal_bin_end[]   asm("_binary_splash_portal_bin_end");
+extern const uint8_t splash_paired_bin_start[] asm("_binary_splash_paired_bin_start");
+extern const uint8_t splash_paired_bin_end[]   asm("_binary_splash_paired_bin_end");
 
 static esp_err_t paint(const uint8_t *start, const uint8_t *end, const char *label)
 {
@@ -42,4 +44,9 @@ esp_err_t splash_show_logo(void)
 esp_err_t splash_show_portal(void)
 {
     return paint(splash_portal_bin_start, splash_portal_bin_end, "portal");
+}
+
+esp_err_t splash_show_paired(void)
+{
+    return paint(splash_paired_bin_start, splash_paired_bin_end, "paired");
 }

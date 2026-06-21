@@ -19,6 +19,17 @@ The wake state machine, MQTT contract, captive-portal provisioning, and NVS sche
 
 Pin map lives in [`include/app_config.h`](include/app_config.h); sourced from Waveshare's reference repo [waveshareteam/ESP32-S3-PhotoPainter](https://github.com/waveshareteam/ESP32-S3-PhotoPainter).
 
+## Transport modes
+
+Since v0.3.0 the firmware speaks two transports to Tesserae and picks between them at boot via NVS. The selection lives in `transport_mode` under the `rest` namespace; the captive portal writes it from a top-of-form radio.
+
+| Mode | When | Pros | Cons |
+| --- | --- | --- | --- |
+| `0` MQTT (default for existing installs) | a broker is already on your LAN | retained-message model; instant push on URL change | requires a broker, captive portal needs broker creds |
+| `1` REST (recommended for new installs) | no broker on hand | zero broker dependency; device picks its own poll cadence; works through any reverse proxy that handles HTTP/JSON | per-wake polling cost; longer first-pair flow |
+
+**Backward compat:** firmware upgrades from <0.3.0 see `transport_mode` absent in NVS and default to MQTT. No re-pair needed. New first-boots get the captive-portal radio.
+
 ## MQTT contract
 
 Same three topics as the 13.3" client under `tesserae/<device_id>/`:
@@ -64,6 +75,19 @@ Two of these feed Tesserae's [smart-sync scheduler](https://github.com/dmellok/t
 - **`sleep_until`** — absolute unix timestamp (UTC seconds) of the intended wake. **Omitted entirely** when NTP hasn't synced yet (first cold boot before the 5 s SNTP window completes). The server treats absent and `0` differently — absent triggers a tolerance-window fallback rather than getting recorded as "device claims to wake at 1970-01-01".
 
 The remaining fields are unchanged from the v1 wire contract and present on every heartbeat.
+
+## REST contract
+
+When `transport_mode = 1`, every wake hits the Tesserae server's `/api/v1/device/<id>/...` endpoints over plain HTTP:
+
+| Method + path | Purpose |
+| --- | --- |
+| `POST /device/discover` | Unauthenticated. Posts identity (`device_id`, `kind`, `panel_w/h`, `fw_version`, `mac`). Server's two responses: **(a)** `registered: false` — the admin hasn't clicked Register yet; firmware deep-sleeps `retry_after_s` and retries on next wake; **(b)** `registered: true` — server matched by MAC; response carries `device_token` for subsequent requests. **Default first-boot path.** |
+| `POST /device/register` | Strict opt-in alternative. Sends the same identity body plus a user-entered `X-Pairing-Code: <6-digit>` header. Server returns `device_token` (201 fresh / 200 reused). Used when the captive portal's `Pairing code` field is filled. |
+| `GET /device/<id>/frame` | Auth: `Authorization: Bearer <device_token>`. Optional `If-None-Match: "<last_etag>"` header. Returns 200 + `{url, format, panel_w, panel_h, render_id, renderer_id}` + `ETag` header (firmware then fetches the `url` and paints), 304 (skip — panel still current), or 204 (server hasn't rendered yet). |
+| `POST /device/<id>/status` | Auth: `Authorization: Bearer <device_token>`. Body: same heartbeat JSON as the MQTT path. Response carries `{status, config, next_poll_s, server_time}` — the firmware applies `config.sleep_interval_s` to NVS and uses `next_poll_s` for this cycle's deep-sleep duration. `server_time` (float seconds) is used to seed the RTC when NTP is unavailable. |
+
+The `device_token` is persisted to NVS the first time it's obtained; subsequent wakes go straight to the frame GET. A `401` on any later request wipes the token and forces re-pairing through the captive portal.
 
 ## Build & flash
 
@@ -138,7 +162,8 @@ tesserae-photopainter-7.3-bin-client/
     ├── wifi_manager.{c,h}        # NVS-backed STA connect
     ├── provisioning.{c,h}        # captive portal + always-on settings server
     ├── mqtt_config.{c,h}         # NVS-backed broker URI / device_id
-    ├── mqtt_handler.{c,h}        # single-shot subscribe + dispatch
+    ├── mqtt_handler.{c,h}        # single-shot subscribe + dispatch (transport=mqtt)
+    ├── rest_handler.{c,h}        # discover/register + frame GET + status POST (transport=rest)
     ├── image_fetcher.{c,h}       # HTTP download into PSRAM
     └── image_decoder.{c,h}       # strict 192000-byte panel-native validation
 ```

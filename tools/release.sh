@@ -118,6 +118,18 @@ fi
 # ----------------------------------------------------------------------------
 # Build
 # ----------------------------------------------------------------------------
+# Force a clean rebuild whenever the secrets-aside dance ran. PlatformIO's
+# incremental build doesn't always re-process a translation unit when a
+# transitively #include'd header disappears (the .d dependency file may
+# not list a no-longer-existent secrets.h), so a cached main.c.o from an
+# earlier WITH-secrets build can silently link into firmware.bin even
+# though secrets.h is now gone. Layer 2 (the post-build strings scan)
+# would then read leaks back out of the cached-.o-linked binary. Nuking
+# the build dir before this leak-sensitive build closes that gap.
+if (( SECRETS_MOVED )); then
+    echo "==> clean build (rm -rf .pio/build/${ENV})"
+    rm -rf ".pio/build/${ENV}"
+fi
 echo "==> building ${ENV} for FW_VERSION=${VERSION}"
 "$PIO" run -e "$ENV" >/dev/null
 

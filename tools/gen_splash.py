@@ -241,6 +241,13 @@ def main():
             print(f"baking {len(args.label)} label line(s) at y={label_y}...")
             overlay_labels(canvas, args.label, label_cx, label_y,
                            font_px=args.label_px)
+    elif args.label:
+        # No QR: stack labels horizontally-centered under the logo.
+        label_y = args.label_y if args.label_y >= 0 \
+                  else args.logo_y + args.logo_size + 16
+        print(f"baking {len(args.label)} label line(s) under logo at y={label_y}...")
+        overlay_labels(canvas, args.label, PANEL_W // 2, label_y,
+                       font_px=args.label_px)
 
     print("Floyd-Steinberg dithering to the 6-colour palette...")
     nibbles = dither_to_nibbles(np.array(canvas, dtype=np.float32))

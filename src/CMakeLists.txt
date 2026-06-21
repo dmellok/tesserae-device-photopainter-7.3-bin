@@ -9,6 +9,7 @@ idf_component_register(
         "mqtt_handler.c"
         "pmic.c"
         "provisioning.c"
+        "rest_handler.c"
         "splash.c"
         "wifi_manager.c"
     INCLUDE_DIRS
@@ -17,6 +18,7 @@ idf_component_register(
     EMBED_FILES
         "../assets/splash_logo.bin"
         "../assets/splash_portal.bin"
+        "../assets/splash_paired.bin"
     REQUIRES
         driver
         esp_driver_i2c
@@ -27,6 +29,7 @@ idf_component_register(
         esp_netif
         esp_wifi
         esp-tls
+        json
         mqtt
         nvs_flash
         mbedtls

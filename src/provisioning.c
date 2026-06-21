@@ -15,6 +15,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "nvs.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "mdns.h"
@@ -140,12 +141,18 @@ static const char k_head[] =
 ".field{margin-bottom:14px}"
 ".field:last-child{margin-bottom:0}"
 "label{display:block;font-weight:500;font-size:13px;margin-bottom:6px;color:var(--fg)}"
-"input,select{width:100%;padding:10px 12px;border:1px solid var(--border);"
+"input:not([type=radio]):not([type=checkbox]),select{"
+"width:100%;padding:10px 12px;border:1px solid var(--border);"
 "border-radius:6px;background:var(--surface);font:inherit;font-size:15px;"
 "color:var(--fg);-webkit-appearance:none;appearance:none;"
 "transition:border-color .12s,box-shadow .12s}"
 "input:focus,select:focus{outline:none;border-color:var(--accent);"
 "box-shadow:0 0 0 3px rgba(13,140,126,.18)}"
+"input[type=radio]{width:auto;margin:0 10px 0 0;vertical-align:middle;"
+"accent-color:var(--accent);cursor:pointer}"
+"label.radio{display:flex;align-items:flex-start;font-weight:500;"
+"font-size:14px;margin-bottom:4px;cursor:pointer;color:var(--fg)}"
+"label.radio strong{font-weight:600}"
 "select{background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),"
 "linear-gradient(135deg,var(--muted) 50%,transparent 50%);"
 "background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;"
@@ -189,22 +196,52 @@ static const char k_form_wifi_fmt[] =
 "</div>"
 "</section>";
 
-/* MQTT card; %s x3 = (mqtt_uri, device_id, mqtt_user) */
-static const char k_form_mqtt_fmt[] =
-"<section class=\"card\"><h2>MQTT broker</h2>"
+/* Transport-mode card; %s x2 = (mqtt_checked, rest_checked). Each is
+ * either ` checked` or empty so the markup interpolates cleanly. The
+ * field changes are JS-driven (see k_tail). */
+static const char k_form_transport_fmt[] =
+"<section class=\"card\"><h2>Transport</h2>"
 "<div class=\"field\">"
-"<label for=\"mqtt_uri\">Broker URI *</label>"
-"<input id=\"mqtt_uri\" name=\"mqtt_uri\" required maxlength=\"159\" "
-"autocomplete=\"off\" value=\"%s\" placeholder=\"mqtt://192.168.1.50:1883\">"
-"<p class=\"hint\">Use <code>mqtts://</code> for TLS; scheme is added if omitted.</p>"
+"<label class=\"radio\" for=\"tr-mqtt\">"
+"<input type=\"radio\" name=\"transport\" value=\"mqtt\" id=\"tr-mqtt\"%s>"
+"<span><strong>MQTT broker</strong>"
+"<p class=\"hint\" style=\"margin:2px 0 0\">"
+"Subscribes to a retained frame topic. Requires a broker on your LAN.</p>"
+"</span>"
+"</label>"
+"<label class=\"radio\" for=\"tr-rest\" style=\"margin-top:10px\">"
+"<input type=\"radio\" name=\"transport\" value=\"rest\" id=\"tr-rest\"%s>"
+"<span><strong>REST API</strong> <span style=\"color:var(--muted);font-weight:400\">(recommended)</span>"
+"<p class=\"hint\" style=\"margin:2px 0 0\">"
+"Polls the Tesserae server directly. No broker needed.</p>"
+"</span>"
+"</label>"
 "</div>"
+"</section>";
+
+/* Device + MQTT card; %s x3 = (mqtt_uri, device_id, mqtt_user).
+ * device_id is shared across transports (it's the URL path component
+ * for the REST API too), so it always shows. The MQTT-broker-specific
+ * fields (URI, user, pass) are wrapped in mqtt-only so the JS in
+ * k_tail can hide them when the user picks REST. */
+static const char k_form_mqtt_fmt[] =
+"<section class=\"card\"><h2>Device</h2>"
 "<div class=\"field\">"
 "<label for=\"device_id\">Device id</label>"
 "<input id=\"device_id\" name=\"device_id\" maxlength=\"32\" "
 "pattern=\"[a-z][a-z0-9_-]{1,31}\" autocomplete=\"off\" "
-"value=\"%s\" placeholder=\"esp32\">"
-"<p class=\"hint\">Topics: <code>tesserae/&lt;id&gt;/frame/bin</code> etc. "
-"Default <code>esp32</code> matches the built-in Tesserae kind.</p>"
+"value=\"%s\" placeholder=\"photopainter-73\">"
+"<p class=\"hint\">URL path / topic namespace: "
+"<code>tesserae/&lt;id&gt;/...</code> or "
+"<code>/api/v1/device/&lt;id&gt;/...</code></p>"
+"</div>"
+"<div class=\"mqtt-only\">"
+"<h2 style=\"margin-top:1.2em\">MQTT broker</h2>"
+"<div class=\"field\">"
+"<label for=\"mqtt_uri\">Broker URI</label>"
+"<input id=\"mqtt_uri\" name=\"mqtt_uri\" maxlength=\"159\" "
+"autocomplete=\"off\" value=\"%s\" placeholder=\"mqtt://192.168.1.50:1883\">"
+"<p class=\"hint\">Use <code>mqtts://</code> for TLS; scheme is added if omitted.</p>"
 "</div>"
 "<div class=\"field\">"
 "<label for=\"mqtt_user\">Username <span style=\"color:var(--muted);font-weight:400\">(optional)</span></label>"
@@ -216,12 +253,37 @@ static const char k_form_mqtt_fmt[] =
 "<button type=\"button\" data-toggle=\"mqtt-pw\" aria-label=\"Show password\">Show</button>"
 "<p class=\"hint\">Leave blank to keep the current password.</p>"
 "</div>"
+"</div>"
+"</section>";
+
+/* REST-API card; %s x2 = (server_url, pairing_code). Hidden by JS
+ * when transport=mqtt. server_url required when REST is selected;
+ * pairing_code optional (blank uses the discover-then-claim flow). */
+static const char k_form_rest_fmt[] =
+"<section class=\"card rest-only\"><h2>Tesserae server</h2>"
+"<div class=\"field\">"
+"<label for=\"server_url\">Server URL</label>"
+"<input id=\"server_url\" name=\"server_url\" maxlength=\"159\" "
+"autocomplete=\"off\" value=\"%s\" placeholder=\"http://tesserae.local:8765\">"
+"<p class=\"hint\">Where Tesserae is reachable from this network. "
+"HTTP only in v1 (no TLS yet).</p>"
+"</div>"
+"<div class=\"field\">"
+"<label for=\"pairing_code\">Pairing code <span style=\"color:var(--muted);font-weight:400\">(optional)</span></label>"
+"<input id=\"pairing_code\" name=\"pairing_code\" maxlength=\"32\" "
+"autocomplete=\"off\" value=\"%s\" placeholder=\"ABCDEF\">"
+"<p class=\"hint\">Leave blank for friendly discovery (admin clicks "
+"<em>Register</em> on Settings &rarr; Devices). Fill in to skip that "
+"step using a code from <em>Pair new device</em>.</p>"
+"</div>"
 "</section>"
 "<button class=\"submit\" type=\"submit\">Save &amp; restart</button>"
 "</form>";
 
-/* JS at end: password show/hide + scan-picker click-to-fill. Inline, no
- * dependencies; runs after the DOM is parsed since it's at the bottom. */
+/* JS at end: password show/hide + scan-picker click-to-fill +
+ * transport-mode radio show/hide of MQTT vs REST field groups.
+ * Inline, no dependencies; runs after the DOM is parsed since it's
+ * at the bottom. */
 static const char k_tail[] =
 "<script>"
 "document.querySelectorAll('[data-toggle]').forEach(b=>{"
@@ -237,6 +299,14 @@ static const char k_tail[] =
 "if(e.target.value){document.getElementById('ssid').value=e.target.value;"
 "document.getElementById('wifi-pw').focus();}"
 "});}"
+"function applyTransport(){"
+"const m=document.getElementById('tr-mqtt').checked;"
+"document.querySelectorAll('.mqtt-only').forEach(n=>n.style.display=m?'':'none');"
+"document.querySelectorAll('.rest-only').forEach(n=>n.style.display=m?'none':'');"
+"}"
+"document.getElementById('tr-mqtt').addEventListener('change',applyTransport);"
+"document.getElementById('tr-rest').addEventListener('change',applyTransport);"
+"applyTransport();"
 "</script></main></body></html>";
 
 static const char k_thanks_html[] =
@@ -318,6 +388,41 @@ static bool form_field(const char *body, const char *key, char *dst, size_t dst_
 
 /* ---------- HTTP handlers ---------- */
 
+/* Read REST settings (transport_mode, server_url, pairing_code) for
+ * form pre-fill.
+ *
+ * Pre-fill rules:
+ *   - If NVS has a transport_mode key, honour it -- preserves user choice
+ *     across portal visits, and protects existing-install backward compat
+ *     (upgrades from <0.3.0 wrote MQTT to NVS implicitly via mqtt_config).
+ *   - If NVS has NO transport_mode key, this is a fresh-install captive
+ *     portal: recommend REST as the default radio. REST is the documented
+ *     "recommended" path; an installer who knows they want MQTT can still
+ *     click the other radio. */
+static void load_rest_prefill(uint8_t *out_mode, char *server_url, size_t su_sz,
+                              char *pairing_code, size_t pc_sz)
+{
+    *out_mode = TRANSPORT_MODE_REST;   /* portal default for fresh installs */
+    server_url[0] = '\0';
+    pairing_code[0] = '\0';
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_REST, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t stored;
+    if (nvs_get_u8(h, NVS_KEY_TRANSPORT_MODE, &stored) == ESP_OK) {
+        *out_mode = stored;
+    }
+    size_t l = su_sz;  nvs_get_str(h, NVS_KEY_SERVER_URL,   server_url,   &l);
+    l = pc_sz;         nvs_get_str(h, NVS_KEY_PAIRING_CODE, pairing_code, &l);
+    nvs_close(h);
+    /* secrets.h fallbacks so dev boards land with the form pre-filled. */
+    if (!server_url[0] && REST_DEFAULT_SERVER_URL[0]) {
+        strncpy(server_url, REST_DEFAULT_SERVER_URL, su_sz - 1);
+    }
+    if (!pairing_code[0] && REST_DEFAULT_PAIRING_CODE[0]) {
+        strncpy(pairing_code, REST_DEFAULT_PAIRING_CODE, pc_sz - 1);
+    }
+}
+
 /* Render the settings form with live NVS values pre-filled and an optional
  * error banner. Sent chunked so we don't need a multi-KB stack buffer. */
 static esp_err_t render_form(httpd_req_t *req, const char *error)
@@ -325,16 +430,24 @@ static esp_err_t render_form(httpd_req_t *req, const char *error)
     mqtt_config_t cfg;
     mqtt_config_load(&cfg);
 
+    uint8_t transport_mode = TRANSPORT_DEFAULT_MODE;
+    char server_url[160] = {0}, pairing_code[16] = {0};
+    load_rest_prefill(&transport_mode, server_url, sizeof server_url,
+                      pairing_code, sizeof pairing_code);
+
     char ssid[33] = {0};
     wifi_creds_get_ssid(ssid, sizeof ssid);
     char ip[16] = {0};
     bool have_ip = wifi_manager_get_sta_ip(ip, sizeof ip);
 
     char e_ssid[160], e_uri[640], e_devid[160], e_user[256];
-    html_escape(ssid,          e_ssid,  sizeof e_ssid);
-    html_escape(cfg.uri,       e_uri,   sizeof e_uri);
-    html_escape(cfg.device_id, e_devid, sizeof e_devid);
-    html_escape(cfg.user,      e_user,  sizeof e_user);
+    char e_server[640], e_pair[64];
+    html_escape(ssid,          e_ssid,   sizeof e_ssid);
+    html_escape(cfg.uri,       e_uri,    sizeof e_uri);
+    html_escape(cfg.device_id, e_devid,  sizeof e_devid);
+    html_escape(cfg.user,      e_user,   sizeof e_user);
+    html_escape(server_url,    e_server, sizeof e_server);
+    html_escape(pairing_code,  e_pair,   sizeof e_pair);
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_sendstr_chunk(req, k_head);
@@ -382,15 +495,27 @@ static esp_err_t render_form(httpd_req_t *req, const char *error)
     }
 
     /* form_wifi must hold: ~580 bytes of literal HTML + escaped ssid + picker
-     * (up to ~1 KB). 2048 leaves headroom. form_mqtt needs to hold literal +
-     * three escaped values; 1800 covers worst case. */
+     * (up to ~1 KB). 2048 leaves headroom. */
     char form_wifi[2048];
     snprintf(form_wifi, sizeof form_wifi, k_form_wifi_fmt, e_ssid, picker);
     httpd_resp_sendstr_chunk(req, form_wifi);
 
+    /* Transport-mode radio: the ` checked` attribute goes on whichever
+     * mode is currently in NVS so the form reflects the live state. */
+    char form_transport[1200];
+    const char *mqtt_checked = (transport_mode == TRANSPORT_MODE_REST) ? "" : " checked";
+    const char *rest_checked = (transport_mode == TRANSPORT_MODE_REST) ? " checked" : "";
+    snprintf(form_transport, sizeof form_transport, k_form_transport_fmt,
+             mqtt_checked, rest_checked);
+    httpd_resp_sendstr_chunk(req, form_transport);
+
     char form_mqtt[1800];
-    snprintf(form_mqtt, sizeof form_mqtt, k_form_mqtt_fmt, e_uri, e_devid, e_user);
+    snprintf(form_mqtt, sizeof form_mqtt, k_form_mqtt_fmt, e_devid, e_uri, e_user);
     httpd_resp_sendstr_chunk(req, form_mqtt);
+
+    char form_rest[1400];
+    snprintf(form_rest, sizeof form_rest, k_form_rest_fmt, e_server, e_pair);
+    httpd_resp_sendstr_chunk(req, form_rest);
 
     httpd_resp_sendstr_chunk(req, k_tail);
     httpd_resp_sendstr_chunk(req, NULL);   /* terminate chunked response */
@@ -402,9 +527,32 @@ static esp_err_t h_root(httpd_req_t *req)
     return render_form(req, NULL);
 }
 
+/* Persist transport_mode + (server_url, pairing_code) to NVS_NS_REST.
+ * Returns ESP_OK on success. */
+static esp_err_t save_rest_config(uint8_t mode,
+                                  const char *server_url,
+                                  const char *pairing_code)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS_REST, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, NVS_KEY_TRANSPORT_MODE, mode);
+    if (err == ESP_OK && server_url) {
+        err = nvs_set_str(h, NVS_KEY_SERVER_URL, server_url);
+    }
+    if (err == ESP_OK) {
+        /* pairing_code is single-use: write what the user gave (even if
+         * empty -- that signals "fall back to discover-then-claim"). */
+        err = nvs_set_str(h, NVS_KEY_PAIRING_CODE, pairing_code ? pairing_code : "");
+    }
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
 static esp_err_t h_save(httpd_req_t *req)
 {
-    char body[1024];
+    char body[1536];
     int total = 0;
     while (total < (int)sizeof(body) - 1) {
         int n = httpd_req_recv(req, body + total, sizeof(body) - 1 - total);
@@ -416,16 +564,25 @@ static esp_err_t h_save(httpd_req_t *req)
     char ssid[33] = {0}, wpa_pass[65] = {0};
     char mqtt_uri[160] = {0}, device_id[33] = {0};
     char mqtt_user[64] = {0}, mqtt_pass[64] = {0};
+    char transport[8] = {0};
+    char server_url[160] = {0}, pairing_code[16] = {0};
 
     bool have_ssid  = form_field(body, "ssid",      ssid,      sizeof ssid)      && ssid[0];
-    bool have_uri   = form_field(body, "mqtt_uri",  mqtt_uri,  sizeof mqtt_uri)  && mqtt_uri[0];
     bool have_pass  = form_field(body, "pass",      wpa_pass,  sizeof wpa_pass)  && wpa_pass[0];
-    form_field(body, "device_id", device_id, sizeof device_id);
+    form_field(body, "transport",     transport,     sizeof transport);
+    form_field(body, "device_id",     device_id,     sizeof device_id);
+    bool have_uri   = form_field(body, "mqtt_uri",  mqtt_uri,  sizeof mqtt_uri)  && mqtt_uri[0];
     form_field(body, "mqtt_user", mqtt_user, sizeof mqtt_user);
     bool have_mpass = form_field(body, "mqtt_pass", mqtt_pass, sizeof mqtt_pass) && mqtt_pass[0];
+    form_field(body, "server_url",   server_url,   sizeof server_url);
+    form_field(body, "pairing_code", pairing_code, sizeof pairing_code);
+
+    /* Default to MQTT if the radio name didn't come through (older browsers
+     * with form-name munging). */
+    bool use_rest = (strcmp(transport, "rest") == 0);
+    uint8_t mode = use_rest ? TRANSPORT_MODE_REST : TRANSPORT_MODE_MQTT;
 
     if (!have_ssid) return render_form(req, "WiFi network name (SSID) is required.");
-    if (!have_uri)  return render_form(req, "MQTT broker URI is required.");
     if (!device_id[0]) strcpy(device_id, MQTT_DEFAULT_DEVICE_ID);   /* blank -> default */
     if (!mqtt_device_id_valid(device_id)) {
         return render_form(req,
@@ -433,17 +590,83 @@ static esp_err_t h_save(httpd_req_t *req)
             "starting with a letter.");
     }
 
-    ESP_LOGI(TAG, "saving ssid='%s' uri='%s' device_id='%s'",
-             ssid, mqtt_uri, device_id);
+    if (use_rest) {
+        if (!server_url[0]) {
+            return render_form(req, "Server URL is required when transport is REST.");
+        }
+        /* Auto-prepend http:// if the user typed just "host:port" or
+         * "host.local:port" (matches the mqtt:// auto-prepend in
+         * mqtt_config_save). https:// also accepted; anything else is
+         * rejected so a stray protocol like ftp:// can't slip through. */
+        if (strncmp(server_url, "http://",  7) != 0 &&
+            strncmp(server_url, "https://", 8) != 0) {
+            if (strstr(server_url, "://") == NULL) {
+                /* No scheme at all -- inject http://. */
+                char tmp[176];
+                int n = snprintf(tmp, sizeof tmp, "http://%s", server_url);
+                if (n > 0 && (size_t) n < sizeof tmp) {
+                    strncpy(server_url, tmp, sizeof server_url - 1);
+                    server_url[sizeof server_url - 1] = '\0';
+                }
+            } else {
+                /* Has some other scheme; reject. */
+                return render_form(req,
+                    "Server URL must start with <code>http://</code> or <code>https://</code>.");
+            }
+        }
+    } else {
+        if (!have_uri) {
+            return render_form(req, "MQTT broker URI is required when transport is MQTT.");
+        }
+    }
+
+    ESP_LOGI(TAG, "saving ssid='%s' transport='%s' device_id='%s' "
+                  "uri='%s' server_url='%s'",
+             ssid, use_rest ? "rest" : "mqtt", device_id,
+             use_rest ? "(skip)" : mqtt_uri,
+             use_rest ? server_url : "(skip)");
 
     /* Passwords: a blank field means "keep what's stored" (NULL), so editing
      * just the device_id via the always-on portal doesn't wipe creds. */
     if (wifi_creds_save(ssid, have_pass ? wpa_pass : NULL) != ESP_OK) {
         return render_form(req, "Failed to write WiFi settings to NVS.");
     }
-    if (mqtt_config_save(mqtt_uri, device_id, mqtt_user,
-                         have_mpass ? mqtt_pass : NULL) != ESP_OK) {
-        return render_form(req, "Failed to write MQTT settings to NVS.");
+    /* MQTT config gets saved either way: device_id + (URI/user/pass when
+     * MQTT mode, or the existing values preserved when REST mode -- so
+     * flipping back to MQTT doesn't lose them). */
+    const char *uri_to_save = use_rest ? NULL : mqtt_uri;
+    if (uri_to_save) {
+        if (mqtt_config_save(uri_to_save, device_id, mqtt_user,
+                             have_mpass ? mqtt_pass : NULL) != ESP_OK) {
+            return render_form(req, "Failed to write MQTT settings to NVS.");
+        }
+    } else {
+        /* REST mode: still need to persist device_id and keep existing MQTT
+         * settings intact. Load + re-save with the new device_id. */
+        mqtt_config_t existing;
+        mqtt_config_load(&existing);
+        if (mqtt_config_save(existing.uri[0] ? existing.uri : "mqtt://0.0.0.0:1883",
+                             device_id, existing.user, NULL) != ESP_OK) {
+            return render_form(req, "Failed to write device id to NVS.");
+        }
+    }
+    if (save_rest_config(mode,
+                         use_rest ? server_url : NULL,
+                         use_rest ? pairing_code : "") != ESP_OK) {
+        return render_form(req, "Failed to write transport settings to NVS.");
+    }
+
+    /* Mark "show paired splash on next boot" so the first wake after the
+     * captive portal can repaint the panel from the QR-portal splash to
+     * "Connected -- waiting for first frame". One-shot flag; main.c
+     * clears it after painting. */
+    {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NS_STATE, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_u8(h, NVS_KEY_PAIRED_PEND, 1);
+            nvs_commit(h);
+            nvs_close(h);
+        }
     }
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");

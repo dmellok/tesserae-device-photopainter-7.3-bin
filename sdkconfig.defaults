@@ -49,3 +49,11 @@ CONFIG_LOG_COLORS=y
 
 # --- Power: we want explicit control, not the IDF power-management hooks ---
 CONFIG_PM_ENABLE=n
+
+# --- Main task stack ---
+# Default 3584 bytes is too tight for our cold-boot path: PMIC bringup +
+# splash paint (epd_port_init + SPI streamer) + WiFi + NTP + REST loop
+# (http_client + cJSON + body capture) all run on app_main's stack. We
+# saw clean stack overflows mid-REST loop on the v0.3.0 paired-splash
+# path. 8 KiB gives generous headroom; PSRAM heap usage is unaffected.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

@@ -28,7 +28,6 @@ static const char *TAG = "pmic";
 #define AXP2101_REG_LDO_VOL1_CTRL         0x93   /* ALDO2 voltage            */
 #define AXP2101_REG_LDO_VOL2_CTRL         0x94   /* ALDO3 voltage            */
 #define AXP2101_REG_LDO_VOL3_CTRL         0x95   /* ALDO4 voltage            */
-#define AXP2101_REG_BAT_PERCENT_DATA      0xA4   /* fuel-gauge percent       */
 
 /* ALDOn = 0.5V + N * 0.1V, encoded in the low 5 bits of LDO_VOLn_CTRL. */
 #define ALDO_VOL_STEP_MV   100
@@ -251,18 +250,69 @@ uint16_t pmic_battery_mv(void) {
     return (uint16_t)(((hi & 0x1F) << 8) | lo);
 }
 
+/* Piecewise-linear 1S LiPo VBAT -> SOC curve under light load (<200 mA).
+ * Endpoints picked from a typical 3.0-4.2 V cell discharge profile; the
+ * mid-curve plateau between 3.7-3.9 V is the noisy region where most cells
+ * spend the majority of their life, so we use finer breakpoints there.
+ *
+ * Why not the AXP2101's built-in 0xA4 fuel gauge: the chip's coulomb
+ * counter needs a battery-design-capacity register written + a full
+ * charge/discharge learning cycle before it tracks reality. The
+ * PhotoPainter ships without that calibration and the user-supplied cell
+ * capacity is unknown anyway. Result: 0xA4 hovers in the 70-100% band
+ * indefinitely and then collapses at the protection cutoff -- the exact
+ * symptom reported. The 0x34/0x35 VBAT ADC is fine, so we derive SOC
+ * from voltage instead. Approximation good to ~5 percentage points,
+ * which is more than enough to drive a "charge me" alert. */
+static const struct { uint16_t mv; uint8_t pct; } VBAT_CURVE[] = {
+    { 4200, 100 },
+    { 4150,  95 },
+    { 4100,  90 },
+    { 4050,  85 },
+    { 4000,  80 },
+    { 3950,  75 },
+    { 3900,  65 },
+    { 3850,  55 },
+    { 3800,  45 },
+    { 3750,  35 },
+    { 3700,  25 },
+    { 3650,  15 },
+    { 3600,   8 },
+    { 3550,   5 },
+    { 3500,   2 },
+    { 3400,   0 },
+};
+
 int pmic_battery_pct(void) {
     if (!s_inited) {
         return -1;
     }
-    uint8_t v = 0;
-    if (axp_read(AXP2101_REG_BAT_PERCENT_DATA, &v) != ESP_OK) {
-        return -1;
+    uint16_t mv = pmic_battery_mv();
+    if (mv == 0) {
+        return -1;   /* ADC unhappy / no battery */
     }
-    if (v > 100) {
-        return -1;   /* sentinel: gauge not yet calibrated */
+    /* Clamp above/below the curve. */
+    if (mv >= VBAT_CURVE[0].mv) {
+        return VBAT_CURVE[0].pct;
     }
-    return (int) v;
+    const size_t n = sizeof(VBAT_CURVE) / sizeof(VBAT_CURVE[0]);
+    if (mv <= VBAT_CURVE[n - 1].mv) {
+        return VBAT_CURVE[n - 1].pct;
+    }
+    /* Find the segment [hi, lo] this mv falls into, then linear-interp. */
+    for (size_t i = 1; i < n; i++) {
+        if (mv >= VBAT_CURVE[i].mv) {
+            uint16_t hi_mv  = VBAT_CURVE[i - 1].mv;
+            uint16_t lo_mv  = VBAT_CURVE[i].mv;
+            uint8_t  hi_pct = VBAT_CURVE[i - 1].pct;
+            uint8_t  lo_pct = VBAT_CURVE[i].pct;
+            int span_mv  = hi_mv - lo_mv;
+            int span_pct = hi_pct - lo_pct;
+            int over_mv  = mv - lo_mv;
+            return lo_pct + (over_mv * span_pct + span_mv / 2) / span_mv;
+        }
+    }
+    return 0;   /* unreachable; clamp covered it */
 }
 
 bool pmic_battery_present(void) {

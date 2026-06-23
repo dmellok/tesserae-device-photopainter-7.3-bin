@@ -37,9 +37,15 @@ esp_err_t pmic_init(void);
  * the ~3 uA sleep floor. */
 esp_err_t pmic_rails_set(bool enabled);
 
-/* Battery telemetry from the on-chip fuel gauge. Returns:
- *   - battery_mv:  millivolts at the cell, or 0 if no battery / read fails
- *   - battery_pct: 0..100, or -1 if no battery / read fails
+/* Battery telemetry. Returns:
+ *   - battery_mv:  millivolts at the cell, or 0 if no battery / read fails.
+ *                  Sourced from the AXP2101's VBAT ADC (regs 0x34/0x35).
+ *   - battery_pct: 0..100, or -1 if no battery / read fails. Derived from
+ *                  battery_mv via a 1S LiPo VBAT->SOC curve, NOT the AXP's
+ *                  built-in coulomb counter (reg 0xA4) -- the latter
+ *                  requires a battery-design-capacity write + learning
+ *                  cycle we don't perform, and without that it hovers in
+ *                  the 70-100% band until the protection cutoff fires.
  * Heartbeat publishes both raw values; Tesserae handles the "unknown"
  * marker semantics on the server side. */
 uint16_t pmic_battery_mv(void);
